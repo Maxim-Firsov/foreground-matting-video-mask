@@ -19,6 +19,9 @@ MOG2_VAR_THRESHOLD = 32.0
 SMALL_KERNEL = 5
 LARGE_KERNEL = 9
 SEED_KERNEL = 15
+GRABCUT_PADDING = 24
+GRABCUT_ITERATIONS = 2
+EDGE_BLUR_SIZE = 5
 MAX_COMPONENT_ASPECT = 6.0
 MIN_FILL_RATIO = 0.08
 MIN_SOLIDITY = 0.22
@@ -214,6 +217,27 @@ def fill_mask_holes(mask: np.ndarray) -> np.ndarray:
     return cv2.bitwise_or(mask, holes)
 
 
+def mask_bounding_box(mask: np.ndarray) -> Roi | None:
+    """Return the tight bounding box around a binary mask."""
+    points = cv2.findNonZero(mask)
+    if points is None:
+        return None
+
+    x, y, w, h = cv2.boundingRect(points)
+    return int(x), int(y), int(w), int(h)
+
+
+def expand_box(box: Roi, frame_size: FrameSize, padding: int) -> Roi:
+    """Expand a box by padding while keeping it inside the frame."""
+    x, y, w, h = box
+    frame_width, frame_height = frame_size
+    x1 = max(0, x - padding)
+    y1 = max(0, y - padding)
+    x2 = min(frame_width, x + w + padding)
+    y2 = min(frame_height, y + h + padding)
+    return x1, y1, x2 - x1, y2 - y1
+
+
 def build_motion_seed(
     prev_gray: np.ndarray,
     curr_gray: np.ndarray,
@@ -241,6 +265,84 @@ def blend_with_history(current_mask: np.ndarray, previous_ema: np.ndarray | None
         cv2.dilate(current, np.ones((LARGE_KERNEL, LARGE_KERNEL), dtype=np.uint8)).astype(np.float32),
     )
     return np.maximum(current, constrained_history)
+
+
+def build_grabcut_seed_mask(coarse_mask: np.ndarray) -> np.ndarray:
+    """Convert a coarse binary mask into a GrabCut trimap."""
+    trimap = np.full(coarse_mask.shape, cv2.GC_PR_BGD, dtype=np.uint8)
+    if not np.any(coarse_mask):
+        trimap[:, :] = cv2.GC_BGD
+        return trimap
+
+    outer = cv2.dilate(
+        coarse_mask,
+        np.ones((LARGE_KERNEL * 2 + 1, LARGE_KERNEL * 2 + 1), dtype=np.uint8),
+        iterations=1,
+    )
+    inner = cv2.erode(
+        coarse_mask,
+        np.ones((SMALL_KERNEL, SMALL_KERNEL), dtype=np.uint8),
+        iterations=1,
+    )
+
+    trimap[outer == 0] = cv2.GC_BGD
+    trimap[coarse_mask > 0] = cv2.GC_PR_FGD
+    trimap[inner > 0] = cv2.GC_FGD
+    return trimap
+
+
+def edge_aware_cleanup(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Snap the matte back toward visible image edges without introducing holes."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 40, 120)
+    edges = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    constrained = cv2.bitwise_or(mask, cv2.bitwise_and(edges, cv2.dilate(mask, np.ones((5, 5), dtype=np.uint8))))
+    constrained = cv2.GaussianBlur(constrained, (EDGE_BLUR_SIZE, EDGE_BLUR_SIZE), 0)
+    cleaned = np.where(constrained >= 32, 255, 0).astype(np.uint8)
+    return fill_mask_holes(clean_binary_mask(cleaned))
+
+
+def refine_mask_with_grabcut(frame: np.ndarray, coarse_mask: np.ndarray) -> np.ndarray:
+    """Refine a coarse subject mask with GrabCut initialized from the current matte."""
+    bbox = mask_bounding_box(coarse_mask)
+    if bbox is None:
+        return coarse_mask
+
+    frame_height, frame_width = coarse_mask.shape[:2]
+    x, y, w, h = expand_box(bbox, (frame_width, frame_height), GRABCUT_PADDING)
+    frame_crop = frame[y : y + h, x : x + w]
+    mask_crop = coarse_mask[y : y + h, x : x + w]
+    trimap = build_grabcut_seed_mask(mask_crop)
+
+    if not np.any(trimap == cv2.GC_FGD):
+        return coarse_mask
+
+    bg_model = np.zeros((1, 65), np.float64)
+    fg_model = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(
+            frame_crop,
+            trimap,
+            None,
+            bg_model,
+            fg_model,
+            GRABCUT_ITERATIONS,
+            cv2.GC_INIT_WITH_MASK,
+        )
+    except cv2.error:
+        return coarse_mask
+
+    refined_crop = np.where(
+        (trimap == cv2.GC_FGD) | (trimap == cv2.GC_PR_FGD),
+        255,
+        0,
+    ).astype(np.uint8)
+    refined_crop = fill_mask_holes(clean_binary_mask(refined_crop))
+
+    refined = np.zeros_like(coarse_mask)
+    refined[y : y + h, x : x + w] = refined_crop
+    refined = cv2.bitwise_or(refined, cv2.erode(coarse_mask, np.ones((3, 3), dtype=np.uint8), iterations=1))
+    return edge_aware_cleanup(frame, refined)
 
 
 def score_component(
@@ -413,6 +515,7 @@ class MotionMaskProcessor:
                     self.config.keep_blobs,
                     self.config.min_area,
                 )
+                selected_mask = refine_mask_with_grabcut(model_frame, selected_mask)
 
                 history_mask = blend_with_history(selected_mask, state.ema_mask, self.config.ema)
                 state.ema_mask = history_mask
