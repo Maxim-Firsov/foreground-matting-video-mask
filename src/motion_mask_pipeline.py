@@ -11,21 +11,22 @@ import numpy as np
 Roi = Tuple[int, int, int, int]
 FrameSize = Tuple[int, int]
 
-MORPH_KERNEL_SIZE = 5
 OVERLAY_ALPHA = 0.35
 ECC_ITERATIONS = 50
 ECC_EPSILON = 1e-4
-MOG2_HISTORY = 500
-MOG2_VAR_THRESHOLD = 24.0
-SUPPORT_DECAY = 0.82
-MAX_COMPONENT_ASPECT = 5.5
-MIN_FILL_RATIO = 0.10
-MIN_SOLIDITY = 0.30
+MOG2_HISTORY = 240
+MOG2_VAR_THRESHOLD = 32.0
+SMALL_KERNEL = 5
+LARGE_KERNEL = 9
+SEED_KERNEL = 15
+MAX_COMPONENT_ASPECT = 6.0
+MIN_FILL_RATIO = 0.08
+MIN_SOLIDITY = 0.22
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    """Runtime configuration for foreground extraction."""
+    """Runtime configuration for the foreground masking pipeline."""
 
     threshold: float
     downscale: float
@@ -39,24 +40,23 @@ class PipelineConfig:
 
 @dataclass(frozen=True)
 class VideoOutputs:
-    """Output paths produced by the processor."""
+    """Output paths written by the processor."""
 
     mask_path: Path
     overlay_path: Path
 
 
 @dataclass
-class MotionState:
-    """State carried across frames."""
+class ProcessorState:
+    """Per-video state carried between frames."""
 
     prev_gray: np.ndarray
-    mask_ema: np.ndarray | None = None
-    temporal_support: np.ndarray | None = None
+    ema_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
 class ComponentCandidate:
-    """Connected foreground region scored by generic shape quality."""
+    """Scored connected component candidate."""
 
     mask: np.ndarray
     area: int
@@ -84,7 +84,7 @@ def parse_roi(roi_text: str | None) -> Roi | None:
 
 
 def validate_roi(roi: Roi | None, frame_size: FrameSize) -> Roi | None:
-    """Ensure the ROI fits within the frame."""
+    """Ensure the ROI remains inside the frame."""
     if roi is None:
         return None
 
@@ -98,7 +98,7 @@ def validate_roi(roi: Roi | None, frame_size: FrameSize) -> Roi | None:
 
 
 def resize_frame(frame: np.ndarray, downscale: float) -> np.ndarray:
-    """Resize the frame when downscale < 1.0; otherwise return it unchanged."""
+    """Resize a frame for faster processing when requested."""
     if downscale >= 1.0:
         return frame
 
@@ -109,7 +109,7 @@ def resize_frame(frame: np.ndarray, downscale: float) -> np.ndarray:
 
 
 def create_writer(output_path: Path, fps: float, frame_size: FrameSize) -> cv2.VideoWriter:
-    """Create an MP4 writer and fail fast when initialization fails."""
+    """Create an MP4 video writer and fail fast if initialization fails."""
     writer = cv2.VideoWriter(
         str(output_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -123,13 +123,13 @@ def create_writer(output_path: Path, fps: float, frame_size: FrameSize) -> cv2.V
 
 
 def prepare_gray(frame: np.ndarray) -> np.ndarray:
-    """Convert a frame to blurred grayscale for stabilization."""
+    """Convert a frame to grayscale used for stabilization and differencing."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return cv2.GaussianBlur(gray, (5, 5), 0)
 
 
 def estimate_ecc_warp(prev_gray: np.ndarray, curr_gray: np.ndarray) -> np.ndarray | None:
-    """Estimate an affine warp aligning the current frame to the previous frame."""
+    """Estimate an affine warp that aligns the current frame to the previous frame."""
     warp_matrix = np.eye(2, 3, dtype=np.float32)
     criteria = (
         cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
@@ -151,8 +151,8 @@ def estimate_ecc_warp(prev_gray: np.ndarray, curr_gray: np.ndarray) -> np.ndarra
     return warp_matrix
 
 
-def warp_frame_to_previous(frame: np.ndarray, warp_matrix: np.ndarray | None) -> np.ndarray:
-    """Warp the current frame into the previous frame coordinate system."""
+def warp_to_previous(frame: np.ndarray, warp_matrix: np.ndarray | None) -> np.ndarray:
+    """Warp a current-frame image into previous-frame coordinates."""
     if warp_matrix is None:
         return frame
 
@@ -166,8 +166,24 @@ def warp_frame_to_previous(frame: np.ndarray, warp_matrix: np.ndarray | None) ->
     )
 
 
+def warp_mask_to_current(mask: np.ndarray, warp_matrix: np.ndarray | None) -> np.ndarray:
+    """Move a mask from stabilized coordinates back to the original current frame."""
+    if warp_matrix is None:
+        return mask
+
+    height, width = mask.shape[:2]
+    return cv2.warpAffine(
+        mask,
+        warp_matrix,
+        (width, height),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
 def create_foreground_model() -> cv2.BackgroundSubtractor:
-    """Create a foreground model that handles dynamic backgrounds better than raw flow."""
+    """Create the primary foreground model."""
     return cv2.createBackgroundSubtractorMOG2(
         history=MOG2_HISTORY,
         varThreshold=MOG2_VAR_THRESHOLD,
@@ -175,46 +191,67 @@ def create_foreground_model() -> cv2.BackgroundSubtractor:
     )
 
 
-def clean_foreground_mask(mask: np.ndarray) -> np.ndarray:
-    """Clean up raw foreground output from the background subtractor."""
-    kernel = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), dtype=np.uint8)
+def clean_binary_mask(mask: np.ndarray) -> np.ndarray:
+    """Denoise and connect a binary mask."""
+    small_kernel = np.ones((SMALL_KERNEL, SMALL_KERNEL), dtype=np.uint8)
+    large_kernel = np.ones((LARGE_KERNEL, LARGE_KERNEL), dtype=np.uint8)
     cleaned = cv2.medianBlur(mask, 5)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, small_kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, large_kernel)
     return cleaned
 
 
-def smooth_mask(mask: np.ndarray, previous_ema: np.ndarray | None, ema: float) -> np.ndarray:
-    """Smooth the foreground mask over time with EMA if requested."""
-    current = (mask > 0).astype(np.float32)
-    if ema <= 0.0:
-        return current
-    if previous_ema is None or previous_ema.shape != current.shape:
-        return current
-    return (ema * current) + ((1.0 - ema) * previous_ema)
+def fill_mask_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill interior holes inside connected regions."""
+    if mask.size == 0:
+        return mask
+
+    flood = mask.copy()
+    h, w = mask.shape[:2]
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv2.floodFill(flood, flood_mask, (0, 0), 255)
+    holes = cv2.bitwise_not(flood)
+    return cv2.bitwise_or(mask, holes)
 
 
-def build_temporal_mask(
-    smoothed_mask: np.ndarray,
-    previous_support: np.ndarray | None,
+def build_motion_seed(
+    prev_gray: np.ndarray,
+    curr_gray: np.ndarray,
     threshold: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Require detections to persist for multiple frames before surviving."""
-    if previous_support is None or previous_support.shape != smoothed_mask.shape:
-        support = smoothed_mask
-    else:
-        support = (previous_support * SUPPORT_DECAY) + smoothed_mask
-
-    binary = np.where(support >= threshold, 255, 0).astype(np.uint8)
-    kernel = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), dtype=np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    return binary, support
+) -> np.ndarray:
+    """Build a motion seed from stabilized frame differencing."""
+    delta = cv2.absdiff(prev_gray, curr_gray)
+    delta = cv2.GaussianBlur(delta, (5, 5), 0)
+    delta_threshold = max(6, int(round(threshold * 6)))
+    seed = np.where(delta >= delta_threshold, 255, 0).astype(np.uint8)
+    seed = clean_binary_mask(seed)
+    seed_kernel = np.ones((SEED_KERNEL, SEED_KERNEL), dtype=np.uint8)
+    return cv2.dilate(seed, seed_kernel, iterations=1)
 
 
-def score_component(mask: np.ndarray, area: int, bbox: Roi) -> ComponentCandidate | None:
-    """Score a component by generic object-likeness rather than clip-specific cues."""
+def blend_with_history(current_mask: np.ndarray, previous_ema: np.ndarray | None, ema: float) -> np.ndarray:
+    """Use prior mask support to fill brief interior dropouts without introducing large trails."""
+    current = (current_mask > 0).astype(np.float32)
+    if ema <= 0.0 or previous_ema is None or previous_ema.shape != current.shape:
+        return current
+
+    history = previous_ema * (1.0 - ema)
+    constrained_history = np.minimum(
+        history,
+        cv2.dilate(current, np.ones((LARGE_KERNEL, LARGE_KERNEL), dtype=np.uint8)).astype(np.float32),
+    )
+    return np.maximum(current, constrained_history)
+
+
+def score_component(
+    mask: np.ndarray,
+    motion_overlap: int,
+    bbox: Roi,
+    area: int,
+) -> ComponentCandidate | None:
+    """Score a component by generic region quality and motion support."""
     _, _, w, h = bbox
-    if min(w, h) < 6:
+    if min(w, h) < 8:
         return None
 
     bbox_area = max(w * h, 1)
@@ -232,15 +269,19 @@ def score_component(mask: np.ndarray, area: int, bbox: Roi) -> ComponentCandidat
     if solidity < MIN_SOLIDITY:
         return None
 
-    score = (area * 0.01) + (fill_ratio * 2.0) + (solidity * 1.5) - (
-        max(aspect_ratio - 1.0, 0.0) * 0.4
-    )
+    overlap_ratio = float(motion_overlap / max(area, 1))
+    score = (area * 0.01) + (fill_ratio * 2.0) + (solidity * 1.5) + (overlap_ratio * 3.0)
     return ComponentCandidate(mask=mask, area=area, score=score)
 
 
-def select_components(mask: np.ndarray, keep_blobs: int, min_area: int) -> np.ndarray:
-    """Keep the strongest coherent components from the foreground mask."""
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+def select_components(
+    base_mask: np.ndarray,
+    motion_seed: np.ndarray,
+    keep_blobs: int,
+    min_area: int,
+) -> np.ndarray:
+    """Keep the best foreground components supported by motion."""
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(base_mask, connectivity=8)
     candidates: list[ComponentCandidate] = []
 
     for label in range(1, num_labels):
@@ -253,20 +294,26 @@ def select_components(mask: np.ndarray, keep_blobs: int, min_area: int) -> np.nd
         w = int(stats[label, cv2.CC_STAT_WIDTH])
         h = int(stats[label, cv2.CC_STAT_HEIGHT])
 
-        component_mask = np.zeros_like(mask)
+        component_mask = np.zeros_like(base_mask)
         component_mask[labels == label] = 255
-        candidate = score_component(component_mask, area, (x, y, w, h))
+        motion_overlap = int(np.count_nonzero((component_mask > 0) & (motion_seed > 0)))
+        if motion_overlap == 0:
+            continue
+
+        filled_component = fill_mask_holes(component_mask)
+        candidate = score_component(filled_component, motion_overlap, (x, y, w, h), area)
         if candidate is not None:
             candidates.append(candidate)
 
     if not candidates:
-        return np.zeros_like(mask)
+        return np.zeros_like(base_mask)
 
     candidates.sort(key=lambda candidate: (candidate.score, candidate.area), reverse=True)
-    output_mask = np.zeros_like(mask)
+    selected = np.zeros_like(base_mask)
     for candidate in candidates[:keep_blobs]:
-        output_mask = cv2.bitwise_or(output_mask, candidate.mask)
-    return output_mask
+        selected = cv2.bitwise_or(selected, candidate.mask)
+
+    return fill_mask_holes(clean_binary_mask(selected))
 
 
 def paste_roi_mask(mask_roi: np.ndarray, frame_size: FrameSize, roi: Roi | None) -> np.ndarray:
@@ -282,14 +329,14 @@ def paste_roi_mask(mask_roi: np.ndarray, frame_size: FrameSize, roi: Roi | None)
 
 
 def create_overlay(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Blend the foreground mask onto the original frame."""
+    """Blend a semi-transparent green mask onto the current frame."""
     overlay_color = np.zeros_like(frame)
     overlay_color[..., 1] = mask
     return cv2.addWeighted(frame, 1.0, overlay_color, OVERLAY_ALPHA, 0.0)
 
 
 class MotionMaskProcessor:
-    """Foreground mask generator built around stabilization and background subtraction."""
+    """Foreground masking pipeline optimized for output alignment and full-region coverage."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -301,7 +348,7 @@ class MotionMaskProcessor:
         return output_fps if output_fps and output_fps > 0 else 30.0
 
     def process(self, input_path: Path, out_dir: Path) -> VideoOutputs:
-        """Process a video and write mask and overlay MP4s."""
+        """Process a video and write editor-friendly mask and overlay MP4s."""
         capture = cv2.VideoCapture(str(input_path))
         if not capture.isOpened():
             raise RuntimeError(f"Cannot open video: {input_path}")
@@ -324,7 +371,8 @@ class MotionMaskProcessor:
         mask_writer = create_writer(mask_path, output_fps, frame_size)
         overlay_writer = create_writer(overlay_path, output_fps, frame_size)
 
-        state = MotionState(prev_gray=prepare_gray(first_frame))
+        first_gray = prepare_gray(first_frame)
+        state = ProcessorState(prev_gray=first_gray)
         warmup_frame = first_frame if roi is None else first_frame[roi[1] : roi[1] + roi[3], roi[0] : roi[0] + roi[2]]
         self.foreground_model.apply(warmup_frame, learningRate=1.0)
 
@@ -338,39 +386,43 @@ class MotionMaskProcessor:
                 if frame.shape[1] != frame_width or frame.shape[0] != frame_height:
                     frame = cv2.resize(frame, frame_size, interpolation=cv2.INTER_AREA)
 
-                curr_gray = prepare_gray(frame)
-                aligned_frame = frame
+                current_gray = prepare_gray(frame)
+                warp_matrix = None
                 if self.config.stabilize:
-                    warp_matrix = estimate_ecc_warp(state.prev_gray, curr_gray)
-                    aligned_frame = warp_frame_to_previous(frame, warp_matrix)
-                    curr_gray = prepare_gray(aligned_frame)
+                    warp_matrix = estimate_ecc_warp(state.prev_gray, current_gray)
+
+                aligned_gray = warp_to_previous(current_gray, warp_matrix)
+                motion_seed_aligned = build_motion_seed(state.prev_gray, aligned_gray, self.config.threshold)
+                motion_seed = warp_mask_to_current(motion_seed_aligned, warp_matrix)
 
                 if roi is None:
-                    model_frame = aligned_frame
+                    model_frame = frame
+                    motion_seed_roi = motion_seed
                 else:
                     x, y, w, h = roi
-                    model_frame = aligned_frame[y : y + h, x : x + w]
+                    model_frame = frame[y : y + h, x : x + w]
+                    motion_seed_roi = motion_seed[y : y + h, x : x + w]
 
-                raw_mask = self.foreground_model.apply(model_frame, learningRate=-1)
-                cleaned_mask = clean_foreground_mask(raw_mask)
-                smoothed_mask = smooth_mask(cleaned_mask, state.mask_ema, self.config.ema)
-                state.mask_ema = smoothed_mask
+                raw_foreground = self.foreground_model.apply(model_frame, learningRate=-1)
+                foreground_mask = np.where(raw_foreground > 0, 255, 0).astype(np.uint8)
+                foreground_mask = clean_binary_mask(foreground_mask)
 
-                temporal_mask, state.temporal_support = build_temporal_mask(
-                    smoothed_mask,
-                    state.temporal_support,
-                    self.config.threshold,
-                )
                 selected_mask = select_components(
-                    temporal_mask,
+                    foreground_mask,
+                    motion_seed_roi,
                     self.config.keep_blobs,
                     self.config.min_area,
                 )
-                full_mask = paste_roi_mask(selected_mask, frame_size, roi)
 
-                mask_writer.write(cv2.cvtColor(full_mask, cv2.COLOR_GRAY2BGR))
-                overlay_writer.write(create_overlay(frame, full_mask))
-                state.prev_gray = curr_gray
+                history_mask = blend_with_history(selected_mask, state.ema_mask, self.config.ema)
+                state.ema_mask = history_mask
+                final_mask_roi = np.where(history_mask >= 0.5, 255, 0).astype(np.uint8)
+                final_mask_roi = fill_mask_holes(clean_binary_mask(final_mask_roi))
+
+                final_mask = paste_roi_mask(final_mask_roi, frame_size, roi)
+                mask_writer.write(cv2.cvtColor(final_mask, cv2.COLOR_GRAY2BGR))
+                overlay_writer.write(create_overlay(frame, final_mask))
+                state.prev_gray = current_gray
         finally:
             capture.release()
             mask_writer.release()
