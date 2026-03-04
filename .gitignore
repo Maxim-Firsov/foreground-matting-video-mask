@@ -16,9 +16,6 @@ Thumbs.db
 outputs/
 *.log
 
-outputs/
-
-
 # Large media
 *.mp4
 *.mov
