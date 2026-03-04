@@ -4,15 +4,18 @@ import argparse
 import sys
 from pathlib import Path
 
+import cv2
+
 from .motion_mask_pipeline import MotionMaskProcessor, PipelineConfig, parse_roi
 
 
 DEFAULT_THRESHOLD = 1.5
-DEFAULT_DOWNSCALE = 1.0
+DEFAULT_DOWNSCALE = None
 DEFAULT_OUT_DIR = "outputs"
 DEFAULT_KEEP_BLOBS = 1
 DEFAULT_MIN_AREA = 500
 DEFAULT_EMA = 0.0
+DEFAULT_PROFILE = "auto"
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,6 +25,12 @@ def parse_args() -> argparse.Namespace:
             "Generate mask.mp4 and overlay.mp4 from generic foreground motion using "
             "stabilization and background subtraction."
         )
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["auto", "quality", "fast"],
+        default=DEFAULT_PROFILE,
+        help="Runtime profile. 'auto' uses a pragmatic profile for large clips.",
     )
     parser.add_argument("--input", required=True, help="Path to the input video file.")
     parser.add_argument(
@@ -78,6 +87,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def inspect_video(input_path: Path) -> tuple[int, int]:
+    """Return source video width and height."""
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Cannot open video: {input_path}")
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    capture.release()
+    return width, height
+
+
+def resolve_profile(args: argparse.Namespace, input_path: Path) -> tuple[float, bool]:
+    """Choose runtime defaults based on profile and clip size."""
+    width, height = inspect_video(input_path)
+    clip_pixels = width * height
+
+    if args.profile == "quality":
+        downscale = args.downscale if args.downscale is not None else 1.0
+        return downscale, not args.no_stabilize
+
+    if args.profile == "fast":
+        downscale = args.downscale if args.downscale is not None else 0.25
+        return downscale, False
+
+    if args.downscale is not None:
+        downscale = args.downscale
+    elif clip_pixels >= 3840 * 2160:
+        downscale = 0.25
+    elif clip_pixels >= 1920 * 1080:
+        downscale = 0.5
+    else:
+        downscale = 1.0
+
+    if args.no_stabilize:
+        stabilize = False
+    else:
+        stabilize = clip_pixels < 1920 * 1080
+
+    return downscale, stabilize
+
+
 def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]:
     """Validate CLI arguments and package them into a pipeline config."""
     input_path = Path(args.input).expanduser().resolve()
@@ -88,8 +138,6 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]
         raise FileNotFoundError(f"Input video not found: {input_path}")
     if args.threshold < 0:
         raise ValueError("--threshold must be >= 0.")
-    if args.downscale <= 0:
-        raise ValueError("--downscale must be > 0.")
     if args.fps is not None and args.fps <= 0:
         raise ValueError("--fps must be > 0 when provided.")
     if args.keep_blobs < 1:
@@ -99,11 +147,15 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]
     if not 0.0 <= args.ema <= 1.0:
         raise ValueError("--ema must be between 0.0 and 1.0.")
 
+    downscale, stabilize = resolve_profile(args, input_path)
+    if downscale <= 0:
+        raise ValueError("--downscale must be > 0.")
+
     config = PipelineConfig(
         threshold=args.threshold,
-        downscale=args.downscale,
+        downscale=downscale,
         fps_override=args.fps,
-        stabilize=not args.no_stabilize,
+        stabilize=stabilize,
         keep_blobs=args.keep_blobs,
         min_area=args.min_area,
         ema=args.ema,
@@ -124,6 +176,7 @@ def main() -> int:
 
     print(f"Mask video written to: {outputs.mask_path}")
     print(f"Overlay video written to: {outputs.overlay_path}")
+    print(f"Run metadata written to: {outputs.metadata_path}")
     return 0
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Tuple
 
@@ -47,6 +48,7 @@ class VideoOutputs:
 
     mask_path: Path
     overlay_path: Path
+    metadata_path: Path
 
 
 @dataclass
@@ -458,12 +460,14 @@ class MotionMaskProcessor:
         out_dir.mkdir(parents=True, exist_ok=True)
         mask_path = out_dir / "mask.mp4"
         overlay_path = out_dir / "overlay.mp4"
+        metadata_path = out_dir / "run_metadata.json"
 
         ok, first_frame = capture.read()
         if not ok or first_frame is None:
             capture.release()
             raise RuntimeError(f"No frames found in video: {input_path}")
 
+        input_height, input_width = first_frame.shape[:2]
         first_frame = resize_frame(first_frame, self.config.downscale)
         frame_height, frame_width = first_frame.shape[:2]
         frame_size = (frame_width, frame_height)
@@ -477,6 +481,7 @@ class MotionMaskProcessor:
         state = ProcessorState(prev_gray=first_gray)
         warmup_frame = first_frame if roi is None else first_frame[roi[1] : roi[1] + roi[3], roi[0] : roi[0] + roi[2]]
         self.foreground_model.apply(warmup_frame, learningRate=1.0)
+        processed_frames = 0
 
         try:
             while True:
@@ -526,9 +531,34 @@ class MotionMaskProcessor:
                 mask_writer.write(cv2.cvtColor(final_mask, cv2.COLOR_GRAY2BGR))
                 overlay_writer.write(create_overlay(frame, final_mask))
                 state.prev_gray = current_gray
+                processed_frames += 1
         finally:
             capture.release()
             mask_writer.release()
             overlay_writer.release()
 
-        return VideoOutputs(mask_path=mask_path, overlay_path=overlay_path)
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "input_path": str(input_path),
+                    "input_frame_size": {"width": input_width, "height": input_height},
+                    "output_frame_size": {"width": frame_width, "height": frame_height},
+                    "processed_frames": processed_frames,
+                    "output_fps": output_fps,
+                    "config": {
+                        "threshold": self.config.threshold,
+                        "downscale": self.config.downscale,
+                        "fps_override": self.config.fps_override,
+                        "stabilize": self.config.stabilize,
+                        "keep_blobs": self.config.keep_blobs,
+                        "min_area": self.config.min_area,
+                        "ema": self.config.ema,
+                        "roi": self.config.roi,
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        return VideoOutputs(mask_path=mask_path, overlay_path=overlay_path, metadata_path=metadata_path)

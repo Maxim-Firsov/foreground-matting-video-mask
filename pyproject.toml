@@ -1,0 +1,14 @@
+[project]
+name = "foreground-matting-video-mask"
+version = "0.1.0"
+description = "Foreground masking pipeline for editor-friendly video outputs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy==2.4.2",
+  "opencv-python==4.13.0.92",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

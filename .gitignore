@@ -1,22 +1,6 @@
-# Python
 __pycache__/
-*.py[cod]
+*.pyc
 .venv/
-venv/
-.env
-.env.*
-
-# OS / Editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-
-# Outputs
+.pytest_cache/
+.ruff_cache/
 outputs/
-*.log
-
-# Large media
-*.mp4
-*.mov
-
