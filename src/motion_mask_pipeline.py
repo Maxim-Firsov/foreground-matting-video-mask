@@ -40,6 +40,7 @@ class PipelineConfig:
     min_area: int
     ema: float
     roi: Roi | None
+    max_frames: int | None
 
 
 @dataclass(frozen=True)
@@ -550,6 +551,8 @@ class MotionMaskProcessor:
                 overlay_writer.write(create_overlay(frame, final_mask))
                 state.prev_gray = current_gray
                 processed_frames += 1
+                if self.config.max_frames is not None and processed_frames >= self.config.max_frames:
+                    break
         finally:
             capture.release()
             mask_writer.release()
@@ -572,6 +575,7 @@ class MotionMaskProcessor:
                         "min_area": self.config.min_area,
                         "ema": self.config.ema,
                         "roi": self.config.roi,
+                        "max_frames": self.config.max_frames,
                     },
                 },
                 indent=2,

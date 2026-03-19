@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional ROI as x,y,w,h. Motion is computed only inside the ROI.",
     )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Optional cap on processed frames after the initial warmup frame.",
+    )
     return parser.parse_args()
 
 
@@ -150,6 +156,8 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]
         raise ValueError("--min-area must be >= 0.")
     if not 0.0 <= args.ema <= 1.0:
         raise ValueError("--ema must be between 0.0 and 1.0.")
+    if args.max_frames is not None and args.max_frames < 1:
+        raise ValueError("--max-frames must be >= 1 when provided.")
 
     downscale, stabilize = resolve_profile(args, input_path)
     if downscale <= 0:
@@ -164,6 +172,7 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]
         min_area=args.min_area,
         ema=args.ema,
         roi=roi,
+        max_frames=args.max_frames,
     )
     return input_path, out_dir, config
 
