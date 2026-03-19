@@ -69,6 +69,17 @@ class ComponentCandidate:
     score: float
 
 
+@dataclass
+class RuntimeStats:
+    """Rolling statistics captured during a processing run."""
+
+    average_mask_coverage: float = 0.0
+    max_mask_coverage: float = 0.0
+    stabilization_attempts: int = 0
+    stabilization_successes: int = 0
+    stabilization_failures: int = 0
+
+
 def parse_roi(roi_text: str | None) -> Roi | None:
     """Parse an ROI string in x,y,w,h form."""
     if roi_text is None:
@@ -465,6 +476,20 @@ def create_overlay(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return cv2.addWeighted(frame, 1.0, overlay_color, OVERLAY_ALPHA, 0.0)
 
 
+def mask_coverage_ratio(mask: np.ndarray) -> float:
+    """Return the fraction of pixels marked as foreground."""
+    if mask.size == 0:
+        return 0.0
+    return float(np.count_nonzero(mask) / mask.size)
+
+
+def update_runtime_stats(stats: RuntimeStats, processed_frames: int, mask: np.ndarray) -> None:
+    """Update running coverage metrics after writing a mask frame."""
+    coverage = mask_coverage_ratio(mask)
+    stats.max_mask_coverage = max(stats.max_mask_coverage, coverage)
+    stats.average_mask_coverage += (coverage - stats.average_mask_coverage) / max(processed_frames, 1)
+
+
 class MotionMaskProcessor:
     """Foreground masking pipeline optimized for output alignment and full-region coverage."""
 
@@ -505,6 +530,7 @@ class MotionMaskProcessor:
 
         first_gray = prepare_gray(first_frame)
         state = ProcessorState(prev_gray=first_gray)
+        runtime_stats = RuntimeStats()
         warmup_frame = first_frame if roi is None else first_frame[roi[1] : roi[1] + roi[3], roi[0] : roi[0] + roi[2]]
         # A full-learning-rate warmup seeds the background model from the first frame
         # before incremental updates begin on subsequent frames.
@@ -524,7 +550,12 @@ class MotionMaskProcessor:
                 current_gray = prepare_gray(frame)
                 warp_matrix = None
                 if self.config.stabilize:
+                    runtime_stats.stabilization_attempts += 1
                     warp_matrix = estimate_ecc_warp(state.prev_gray, current_gray)
+                    if warp_matrix is None:
+                        runtime_stats.stabilization_failures += 1
+                    else:
+                        runtime_stats.stabilization_successes += 1
 
                 # The pipeline combines motion differencing and background subtraction:
                 # differencing emphasizes change, while MOG2 supplies a region prior.
@@ -564,6 +595,7 @@ class MotionMaskProcessor:
                 overlay_writer.write(create_overlay(frame, final_mask))
                 state.prev_gray = current_gray
                 processed_frames += 1
+                update_runtime_stats(runtime_stats, processed_frames, final_mask)
                 if self.config.max_frames is not None and processed_frames >= self.config.max_frames:
                     break
         finally:
@@ -579,6 +611,13 @@ class MotionMaskProcessor:
                     "output_frame_size": {"width": frame_width, "height": frame_height},
                     "processed_frames": processed_frames,
                     "output_fps": output_fps,
+                    "processing_stats": {
+                        "average_mask_coverage": runtime_stats.average_mask_coverage,
+                        "max_mask_coverage": runtime_stats.max_mask_coverage,
+                        "stabilization_attempts": runtime_stats.stabilization_attempts,
+                        "stabilization_successes": runtime_stats.stabilization_successes,
+                        "stabilization_failures": runtime_stats.stabilization_failures,
+                    },
                     "config": {
                         "threshold": self.config.threshold,
                         "downscale": self.config.downscale,

@@ -3,13 +3,17 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import numpy as np
 
 try:
-    from src.motion_mask_pipeline import parse_roi, scale_roi_to_frame, validate_roi
+    from src.motion_mask_pipeline import RuntimeStats, mask_coverage_ratio, parse_roi, scale_roi_to_frame, update_runtime_stats, validate_roi
     from src.foreground_mask import resolve_profile, validate_args
 except ModuleNotFoundError as exc:
+    RuntimeStats = None
+    mask_coverage_ratio = None
     parse_roi = None
     scale_roi_to_frame = None
+    update_runtime_stats = None
     validate_roi = None
     resolve_profile = None
     validate_args = None
@@ -33,6 +37,10 @@ class PipelineConfigTests(unittest.TestCase):
 
     def test_scale_roi_to_frame_downscales_coordinates(self) -> None:
         self.assertEqual(scale_roi_to_frame((100, 40, 320, 200), 0.5), (50, 20, 160, 100))
+
+    def test_mask_coverage_ratio_counts_foreground_pixels(self) -> None:
+        mask = np.array([[0, 255], [255, 0]], dtype=np.uint8)
+        self.assertEqual(mask_coverage_ratio(mask), 0.5)
 
     @patch("src.foreground_mask.inspect_video", return_value=(4096, 2160))
     def test_auto_profile_downscales_large_clip(self, _inspect_video) -> None:
@@ -120,6 +128,15 @@ class PipelineConfigTests(unittest.TestCase):
 
         self.assertEqual(config.downscale, 0.25)
         self.assertEqual(config.roi, (100, 50, 200, 150))
+
+    def test_update_runtime_stats_tracks_average_and_peak_coverage(self) -> None:
+        stats = RuntimeStats()
+
+        update_runtime_stats(stats, 1, np.array([[0, 255], [0, 255]], dtype=np.uint8))
+        update_runtime_stats(stats, 2, np.array([[0, 0], [0, 255]], dtype=np.uint8))
+
+        self.assertAlmostEqual(stats.average_mask_coverage, 0.375)
+        self.assertAlmostEqual(stats.max_mask_coverage, 0.5)
 
 
 if __name__ == "__main__":
