@@ -5,10 +5,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 try:
-    from src.motion_mask_pipeline import parse_roi, validate_roi
+    from src.motion_mask_pipeline import parse_roi, scale_roi_to_frame, validate_roi
     from src.foreground_mask import resolve_profile, validate_args
 except ModuleNotFoundError as exc:
     parse_roi = None
+    scale_roi_to_frame = None
     validate_roi = None
     resolve_profile = None
     validate_args = None
@@ -29,6 +30,9 @@ class PipelineConfigTests(unittest.TestCase):
     def test_validate_roi_rejects_out_of_bounds_regions(self) -> None:
         with self.assertRaises(ValueError):
             validate_roi((10, 20, 800, 600), (640, 360))
+
+    def test_scale_roi_to_frame_downscales_coordinates(self) -> None:
+        self.assertEqual(scale_roi_to_frame((100, 40, 320, 200), 0.5), (50, 20, 160, 100))
 
     @patch("src.foreground_mask.inspect_video", return_value=(4096, 2160))
     def test_auto_profile_downscales_large_clip(self, _inspect_video) -> None:
@@ -90,6 +94,32 @@ class PipelineConfigTests(unittest.TestCase):
         _, _, config = validate_args(args)
 
         self.assertEqual(config.max_frames, 12)
+
+    @patch("src.foreground_mask.inspect_video", return_value=(4096, 2160))
+    def test_validate_args_scales_roi_into_processed_frame_space(self, _inspect_video) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "input": __file__,
+                "out_dir": "outputs",
+                "threshold": 1.5,
+                "downscale": None,
+                "fps": None,
+                "no_stabilize": False,
+                "keep_blobs": 1,
+                "min_area": 500,
+                "ema": 0.0,
+                "roi": "400,200,800,600",
+                "profile": "auto",
+                "max_frames": None,
+            },
+        )()
+
+        _, _, config = validate_args(args)
+
+        self.assertEqual(config.downscale, 0.25)
+        self.assertEqual(config.roi, (100, 50, 200, 150))
 
 
 if __name__ == "__main__":

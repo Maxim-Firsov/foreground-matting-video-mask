@@ -6,7 +6,7 @@ from pathlib import Path
 
 import cv2
 
-from .motion_mask_pipeline import MotionMaskProcessor, PipelineConfig, parse_roi
+from .motion_mask_pipeline import MotionMaskProcessor, PipelineConfig, parse_roi, scale_roi_to_frame
 
 
 DEFAULT_THRESHOLD = 1.5
@@ -142,7 +142,7 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]
     """Validate CLI arguments and package them into a pipeline config."""
     input_path = Path(args.input).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
-    roi = parse_roi(args.roi)
+    source_roi = parse_roi(args.roi)
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input video not found: {input_path}")
@@ -171,7 +171,7 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]
         keep_blobs=args.keep_blobs,
         min_area=args.min_area,
         ema=args.ema,
-        roi=roi,
+        roi=scale_roi_to_frame(source_roi, downscale),
         max_frames=args.max_frames,
     )
     return input_path, out_dir, config

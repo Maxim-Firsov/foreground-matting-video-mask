@@ -103,6 +103,19 @@ def validate_roi(roi: Roi | None, frame_size: FrameSize) -> Roi | None:
     return roi
 
 
+def scale_roi_to_frame(roi: Roi | None, downscale: float) -> Roi | None:
+    """Scale a source-resolution ROI into the processed frame coordinate space."""
+    if roi is None or downscale >= 1.0:
+        return roi
+
+    x, y, w, h = roi
+    scaled_x = max(0, int(round(x * downscale)))
+    scaled_y = max(0, int(round(y * downscale)))
+    scaled_w = max(1, int(round(w * downscale)))
+    scaled_h = max(1, int(round(h * downscale)))
+    return scaled_x, scaled_y, scaled_w, scaled_h
+
+
 def resize_frame(frame: np.ndarray, downscale: float) -> np.ndarray:
     """Resize a frame for faster processing when requested."""
     if downscale >= 1.0:
