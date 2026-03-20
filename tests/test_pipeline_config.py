@@ -7,7 +7,7 @@ import numpy as np
 
 try:
     from src.motion_mask_pipeline import RuntimeStats, mask_coverage_ratio, parse_roi, scale_roi_to_frame, update_runtime_stats, validate_roi
-    from src.foreground_mask import resolve_profile, validate_args
+    from src.foreground_mask import resolve_profile, resolve_profile_from_dimensions, validate_args
 except ModuleNotFoundError as exc:
     RuntimeStats = None
     mask_coverage_ratio = None
@@ -16,6 +16,7 @@ except ModuleNotFoundError as exc:
     update_runtime_stats = None
     validate_roi = None
     resolve_profile = None
+    resolve_profile_from_dimensions = None
     validate_args = None
     IMPORT_ERROR = exc
 else:
@@ -55,6 +56,14 @@ class PipelineConfigTests(unittest.TestCase):
         downscale, stabilize = resolve_profile(args, Path("demo.mp4"))
         self.assertEqual(downscale, 1.0)
         self.assertTrue(stabilize)
+
+    def test_auto_profile_uses_mid_resolution_defaults_at_full_hd_boundary(self) -> None:
+        args = type("Args", (), {"profile": "auto", "downscale": None, "no_stabilize": False})()
+
+        downscale, stabilize = resolve_profile_from_dimensions(args, 1920, 1080)
+
+        self.assertEqual(downscale, 0.5)
+        self.assertFalse(stabilize)
 
     def test_validate_args_rejects_non_positive_max_frames(self) -> None:
         args = type(

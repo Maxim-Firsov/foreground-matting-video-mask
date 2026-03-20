@@ -104,9 +104,8 @@ def inspect_video(input_path: Path) -> tuple[int, int]:
     return width, height
 
 
-def resolve_profile(args: argparse.Namespace, input_path: Path) -> tuple[float, bool]:
-    """Choose runtime defaults based on profile and clip size."""
-    width, height = inspect_video(input_path)
+def resolve_profile_from_dimensions(args: argparse.Namespace, width: int, height: int) -> tuple[float, bool]:
+    """Choose runtime defaults based on profile and source dimensions."""
     clip_pixels = width * height
 
     if args.profile == "quality":
@@ -138,6 +137,12 @@ def resolve_profile(args: argparse.Namespace, input_path: Path) -> tuple[float, 
     return downscale, stabilize
 
 
+def resolve_profile(args: argparse.Namespace, input_path: Path) -> tuple[float, bool]:
+    """Choose runtime defaults based on profile and clip size."""
+    width, height = inspect_video(input_path)
+    return resolve_profile_from_dimensions(args, width, height)
+
+
 def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]:
     """Validate CLI arguments and package them into a pipeline config."""
     input_path = Path(args.input).expanduser().resolve()
@@ -162,7 +167,7 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]
     source_width, source_height = inspect_video(input_path)
     validate_roi(source_roi, (source_width, source_height))
 
-    downscale, stabilize = resolve_profile(args, input_path)
+    downscale, stabilize = resolve_profile_from_dimensions(args, source_width, source_height)
     if downscale <= 0:
         raise ValueError("--downscale must be > 0.")
 
