@@ -129,6 +129,30 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertEqual(config.downscale, 0.25)
         self.assertEqual(config.roi, (100, 50, 200, 150))
 
+    @patch("src.foreground_mask.inspect_video", return_value=(4096, 2160))
+    def test_validate_args_rejects_source_roi_outside_input_frame(self, _inspect_video) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "input": __file__,
+                "out_dir": "outputs",
+                "threshold": 1.5,
+                "downscale": None,
+                "fps": None,
+                "no_stabilize": False,
+                "keep_blobs": 1,
+                "min_area": 500,
+                "ema": 0.0,
+                "roi": "3900,2000,400,300",
+                "profile": "auto",
+                "max_frames": None,
+            },
+        )()
+
+        with self.assertRaisesRegex(ValueError, "exceeds frame bounds"):
+            validate_args(args)
+
     def test_update_runtime_stats_tracks_average_and_peak_coverage(self) -> None:
         stats = RuntimeStats()
 

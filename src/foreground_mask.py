@@ -6,7 +6,7 @@ from pathlib import Path
 
 import cv2
 
-from .motion_mask_pipeline import MotionMaskProcessor, PipelineConfig, parse_roi, scale_roi_to_frame
+from .motion_mask_pipeline import MotionMaskProcessor, PipelineConfig, parse_roi, scale_roi_to_frame, validate_roi
 
 
 DEFAULT_THRESHOLD = 1.5
@@ -158,6 +158,9 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path, PipelineConfig]
         raise ValueError("--ema must be between 0.0 and 1.0.")
     if args.max_frames is not None and args.max_frames < 1:
         raise ValueError("--max-frames must be >= 1 when provided.")
+
+    source_width, source_height = inspect_video(input_path)
+    validate_roi(source_roi, (source_width, source_height))
 
     downscale, stabilize = resolve_profile(args, input_path)
     if downscale <= 0:
