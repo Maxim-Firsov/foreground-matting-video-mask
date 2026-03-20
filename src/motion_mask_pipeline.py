@@ -80,6 +80,47 @@ class RuntimeStats:
     stabilization_failures: int = 0
 
 
+def build_run_metadata(
+    *,
+    input_path: Path,
+    input_frame_size: FrameSize,
+    output_frame_size: FrameSize,
+    source_frame_count: int | None,
+    processed_frames: int,
+    output_fps: float,
+    config: PipelineConfig,
+    runtime_stats: RuntimeStats,
+) -> dict[str, object]:
+    """Build the machine-readable run metadata payload."""
+    return {
+        "input_path": str(input_path),
+        "input_frame_size": {"width": input_frame_size[0], "height": input_frame_size[1]},
+        "output_frame_size": {"width": output_frame_size[0], "height": output_frame_size[1]},
+        "source_frame_count": source_frame_count,
+        "processed_frames": processed_frames,
+        "stopped_early": config.max_frames is not None and processed_frames >= config.max_frames,
+        "output_fps": output_fps,
+        "processing_stats": {
+            "average_mask_coverage": runtime_stats.average_mask_coverage,
+            "max_mask_coverage": runtime_stats.max_mask_coverage,
+            "stabilization_attempts": runtime_stats.stabilization_attempts,
+            "stabilization_successes": runtime_stats.stabilization_successes,
+            "stabilization_failures": runtime_stats.stabilization_failures,
+        },
+        "config": {
+            "threshold": config.threshold,
+            "downscale": config.downscale,
+            "fps_override": config.fps_override,
+            "stabilize": config.stabilize,
+            "keep_blobs": config.keep_blobs,
+            "min_area": config.min_area,
+            "ema": config.ema,
+            "roi": config.roi,
+            "max_frames": config.max_frames,
+        },
+    }
+
+
 def parse_roi(roi_text: str | None) -> Roi | None:
     """Parse an ROI string in x,y,w,h form."""
     if roi_text is None:
@@ -507,6 +548,8 @@ class MotionMaskProcessor:
         capture = cv2.VideoCapture(str(input_path))
         if not capture.isOpened():
             raise RuntimeError(f"Cannot open video: {input_path}")
+        source_frame_count_raw = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        source_frame_count = source_frame_count_raw if source_frame_count_raw > 0 else None
 
         out_dir.mkdir(parents=True, exist_ok=True)
         mask_path = out_dir / "mask.mp4"
@@ -603,36 +646,16 @@ class MotionMaskProcessor:
             mask_writer.release()
             overlay_writer.release()
 
-        metadata_path.write_text(
-            json.dumps(
-                {
-                    "input_path": str(input_path),
-                    "input_frame_size": {"width": input_width, "height": input_height},
-                    "output_frame_size": {"width": frame_width, "height": frame_height},
-                    "processed_frames": processed_frames,
-                    "output_fps": output_fps,
-                    "processing_stats": {
-                        "average_mask_coverage": runtime_stats.average_mask_coverage,
-                        "max_mask_coverage": runtime_stats.max_mask_coverage,
-                        "stabilization_attempts": runtime_stats.stabilization_attempts,
-                        "stabilization_successes": runtime_stats.stabilization_successes,
-                        "stabilization_failures": runtime_stats.stabilization_failures,
-                    },
-                    "config": {
-                        "threshold": self.config.threshold,
-                        "downscale": self.config.downscale,
-                        "fps_override": self.config.fps_override,
-                        "stabilize": self.config.stabilize,
-                        "keep_blobs": self.config.keep_blobs,
-                        "min_area": self.config.min_area,
-                        "ema": self.config.ema,
-                        "roi": self.config.roi,
-                        "max_frames": self.config.max_frames,
-                    },
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        metadata = build_run_metadata(
+            input_path=input_path,
+            input_frame_size=(input_width, input_height),
+            output_frame_size=frame_size,
+            source_frame_count=source_frame_count,
+            processed_frames=processed_frames,
+            output_fps=output_fps,
+            config=self.config,
+            runtime_stats=runtime_stats,
         )
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
         return VideoOutputs(mask_path=mask_path, overlay_path=overlay_path, metadata_path=metadata_path)

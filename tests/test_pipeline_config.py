@@ -6,10 +6,12 @@ from unittest.mock import patch
 import numpy as np
 
 try:
-    from src.motion_mask_pipeline import RuntimeStats, mask_coverage_ratio, parse_roi, scale_roi_to_frame, update_runtime_stats, validate_roi
+    from src.motion_mask_pipeline import PipelineConfig, RuntimeStats, build_run_metadata, mask_coverage_ratio, parse_roi, scale_roi_to_frame, update_runtime_stats, validate_roi
     from src.foreground_mask import resolve_profile, resolve_profile_from_dimensions, validate_args
 except ModuleNotFoundError as exc:
     RuntimeStats = None
+    PipelineConfig = None
+    build_run_metadata = None
     mask_coverage_ratio = None
     parse_roi = None
     scale_roi_to_frame = None
@@ -170,6 +172,42 @@ class PipelineConfigTests(unittest.TestCase):
 
         self.assertAlmostEqual(stats.average_mask_coverage, 0.375)
         self.assertAlmostEqual(stats.max_mask_coverage, 0.5)
+
+    def test_build_run_metadata_includes_frame_count_and_early_stop_flag(self) -> None:
+        config = PipelineConfig(
+            threshold=1.5,
+            downscale=0.5,
+            fps_override=None,
+            stabilize=False,
+            keep_blobs=1,
+            min_area=500,
+            ema=0.2,
+            roi=(10, 20, 30, 40),
+            max_frames=12,
+        )
+        stats = RuntimeStats(
+            average_mask_coverage=0.25,
+            max_mask_coverage=0.5,
+            stabilization_attempts=10,
+            stabilization_successes=8,
+            stabilization_failures=2,
+        )
+
+        metadata = build_run_metadata(
+            input_path=Path("demo.mp4"),
+            input_frame_size=(4096, 2160),
+            output_frame_size=(2048, 1080),
+            source_frame_count=166,
+            processed_frames=12,
+            output_fps=25.0,
+            config=config,
+            runtime_stats=stats,
+        )
+
+        self.assertEqual(metadata["source_frame_count"], 166)
+        self.assertTrue(metadata["stopped_early"])
+        self.assertEqual(metadata["config"]["roi"], (10, 20, 30, 40))
+        self.assertEqual(metadata["processing_stats"]["stabilization_successes"], 8)
 
 
 if __name__ == "__main__":
